@@ -471,28 +471,40 @@ def place_fok_buy_usd(
     # FOK BUY should be modeled as market-order args with amount in USD.
     # We try SDK market-order methods first; fallback to limit+FOK if unavailable.
     if hasattr(client, "create_market_order"):
-        mo_args = MarketOrderArgs(
-            token_id=token_id,
-            amount=stake_usd,
-            side=BUY,
-            price=effective_max_price,
-            order_type=OrderType.FOK,
-        )
-        mo = client.create_market_order(mo_args)
-        resp = client.post_order(mo, OrderType.FOK)
-        return {
-            "token_id": token_id,
-            "amount_usd": stake_usd,
-            "worst_price": effective_max_price,
-            "order_type": "FOK",
-            "response": resp,
-        }
+        try:
+            mo_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=stake_usd,
+                side=BUY,
+                price=effective_max_price,
+                order_type=OrderType.FOK,
+            )
+            mo = client.create_market_order(mo_args)
+            resp = client.post_order(mo, OrderType.FOK)
+            return {
+                "token_id": token_id,
+                "amount_usd": stake_usd,
+                "worst_price": effective_max_price,
+                "order_type": "FOK",
+                "response": resp,
+            }
+        except Exception as e:
+            logger.warning("create_market_order path failed, fallback to limit+FOK: %s", e)
     if hasattr(client, "createMarketOrder"):
-        mo = client.createMarketOrder(
-            {"tokenID": token_id, "amount": stake_usd, "side": BUY, "price": effective_max_price}
-        )
-        resp = client.post_order(mo, OrderType.FOK)
-        return {"token_id": token_id, "amount_usd": stake_usd, "worst_price": effective_max_price, "order_type": "FOK", "response": resp}
+        try:
+            mo = client.createMarketOrder(
+                {"tokenID": token_id, "amount": stake_usd, "side": BUY, "price": effective_max_price}
+            )
+            resp = client.post_order(mo, OrderType.FOK)
+            return {
+                "token_id": token_id,
+                "amount_usd": stake_usd,
+                "worst_price": effective_max_price,
+                "order_type": "FOK",
+                "response": resp,
+            }
+        except Exception as e:
+            logger.warning("createMarketOrder path failed, fallback to limit+FOK: %s", e)
 
     # Compatibility fallback
     return place_limit_buy(
@@ -606,9 +618,7 @@ async def webhook(req: Request) -> Dict[str, Any]:
         try:
             if hasattr(client, "get_order_book"):
                 book = client.get_order_book(token_id)
-            else:
-                book = client.get_book(token_id)
-            best_ask = extract_best_ask(book)
+                best_ask = extract_best_ask(book)
         except Exception as e:
             logger.warning("book pre-check failed: %s", e)
 
