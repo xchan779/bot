@@ -170,14 +170,32 @@ def parse_json_list_field(v: Any) -> list:
 
 def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
     url = "https://gamma-api.polymarket.com/markets"
-    params = {
-        "closed": "false",
-        "enableOrderBook": "true",
-        "limit": 1000,
-    }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    markets = r.json()
+
+    # 1) Try direct series query first (most reliable for rotating 15m markets)
+    # 2) Fallback to broader closed=false scan if series query returns empty.
+    params_list = [
+        {
+            "seriesSlug": "btc-up-or-down-15m",
+            "closed": "false",
+            "enableOrderBook": "true",
+            "limit": 500,
+        },
+        {
+            "closed": "false",
+            "enableOrderBook": "true",
+            "limit": 2000,
+        },
+    ]
+
+    markets = None
+    for params in params_list:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list) and len(data) > 0:
+            markets = data
+            break
+
     if not isinstance(markets, list):
         raise RuntimeError("Gamma response is not a list")
 
@@ -214,49 +232,42 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         if end_dt <= now:
             continue
 
-        outcomes = parse_json_list_field(m.get("outcomes"))
-        token_ids = parse_json_list_field(m.get("clobTokenIds"))
-
-        if len(outcomes) != 2 or len(token_ids) != 2:
-            continue
-
-        # Map token positions supporting both ["Yes","No"] and ["Up","Down"].
-        # We keep variable names yes/no for compatibility with downstream code:
-        # yes_token => token to buy when model says UP
-        # no_token  => token to buy when model says DOWN
-        out0 = str(outcomes[0]).strip().lower()
-        out1 = str(outcomes[1]).strip().lower()
-
-        if out0 in {"yes", "up"} and out1 in {"no", "down"}:
-            yes_token = str(token_ids[0])
-            no_token = str(token_ids[1])
-        elif out0 in {"no", "down"} and out1 in {"yes", "up"}:
-            yes_token = str(token_ids[1])
-            no_token = str(token_ids[0])
-        else:
-            continue
-
         seconds_to_end = (end_dt - now).total_seconds()
         if seconds_to_end <= 0:
             continue
 
-        # Keep only short-horizon markets likely to be 15m contracts.
-        # We allow up to 2 hours so we can select the next contract even if
-        # Gamma hasn't flipped active=true yet.
-        if seconds_to_end < 30 or seconds_to_end > 7200:
+        outcomes = parse_json_list_field(m.get("outcomes"))
+        token_ids = parse_json_list_field(m.get("clobTokenIds"))
+        if len(outcomes) != 2 or len(token_ids) != 2:
+            continue
+
+        # Strictly target near-term 15m contract window.
+        if not (60 <= seconds_to_end <= 15 * 60):
             continue
 
         # Prefer explicit up/down naming if available, otherwise fallback to
         # nearest active BTC 15m yes/no market.
         priority = 0 if is_updown_like else 1
-        candidates.append((priority, seconds_to_end, yes_token, no_token, m))
+        candidates.append((priority, seconds_to_end, token_ids, outcomes, m))
 
     if not candidates:
         raise RuntimeError("No active BTC 15m up/down market found in Gamma")
 
     candidates.sort(key=lambda x: (x[0], x[1]))
-    _, _, yes_token, no_token, market = candidates[0]
-    return yes_token, no_token, market
+    _, _, token_ids, outcomes, market = candidates[0]
+
+    out0 = str(outcomes[0]).strip().lower()
+    out1 = str(outcomes[1]).strip().lower()
+    if out0 in {"yes", "up"} and out1 in {"no", "down"}:
+        up_token = str(token_ids[0])
+        down_token = str(token_ids[1])
+    elif out0 in {"no", "down"} and out1 in {"yes", "up"}:
+        up_token = str(token_ids[1])
+        down_token = str(token_ids[0])
+    else:
+        raise RuntimeError(f"Unexpected outcomes for BTC 15m market: {outcomes}")
+
+    return up_token, down_token, market
 
 
 def build_client(s: Settings) -> ClobClient:
