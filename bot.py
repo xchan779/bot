@@ -207,6 +207,8 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
             end_dt = datetime.fromisoformat(str(end_s).replace("Z", "+00:00"))
         except ValueError:
             continue
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
 
         if end_dt <= now:
             continue
