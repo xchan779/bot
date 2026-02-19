@@ -174,7 +174,7 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         "closed": "false",
         "active": "true",
         "enableOrderBook": "true",
-        "limit": 500,
+        "limit": 1000,
     }
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
@@ -196,10 +196,8 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
 
         if "btc" not in text and "bitcoin" not in text:
             continue
-        if "15" not in text:
-            continue
-        # Some 15m BTC markets are not labeled explicitly as "up/down" and may
-        # be phrased as yes/no around a reference level. Keep them as candidates.
+        # Some markets are not labeled explicitly as "15m up/down".
+        # Accept BTC binary markets and infer 15m behavior from time-to-end.
         is_updown_like = ("up" in text and "down" in text) or ("higher" in text and "lower" in text)
 
         end_s = m.get("endDateIso") or m.get("endDate")
@@ -235,6 +233,11 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
 
         seconds_to_end = (end_dt - now).total_seconds()
         if seconds_to_end <= 0:
+            continue
+
+        # Keep only short-horizon markets likely to be 15m contracts.
+        # We allow 2..30 minutes to tolerate listing/rollover timing.
+        if seconds_to_end < 120 or seconds_to_end > 1800:
             continue
 
         # Prefer explicit up/down naming if available, otherwise fallback to
