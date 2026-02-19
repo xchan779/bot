@@ -168,33 +168,72 @@ def parse_json_list_field(v: Any) -> list:
     return []
 
 
+def fetch_btc_15m_markets_from_events() -> list:
+    events_url = "https://gamma-api.polymarket.com/events"
+    markets_url = "https://gamma-api.polymarket.com/markets"
+
+    # Pull current open events, then resolve event slug -> market object.
+    r = requests.get(
+        events_url,
+        params={"closed": "false", "active": "true", "limit": 500},
+        timeout=20,
+    )
+    r.raise_for_status()
+    events = r.json()
+    if not isinstance(events, list):
+        return []
+
+    markets: list = []
+    seen_ids = set()
+
+    for ev in events:
+        slug = str(ev.get("slug", "") or "")
+        title = str(ev.get("title", "") or "")
+        series_slug = str(ev.get("seriesSlug", "") or "")
+        text = f"{slug} {title} {series_slug}".lower()
+
+        is_btc = ("btc" in text) or ("bitcoin" in text)
+        is_15m = ("15m" in text) or ("up-or-down-15m" in text) or ("updown-15m" in text)
+        if not (is_btc and is_15m):
+            continue
+
+        # Some event payloads embed markets directly.
+        embedded = ev.get("markets")
+        if isinstance(embedded, list):
+            for m in embedded:
+                mid = str(m.get("id", ""))
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    markets.append(m)
+
+        # Resolve slug to full market object with clobTokenIds.
+        if slug:
+            rm = requests.get(markets_url, params={"slug": slug}, timeout=20)
+            rm.raise_for_status()
+            data = rm.json()
+            if isinstance(data, list):
+                for m in data:
+                    mid = str(m.get("id", ""))
+                    if mid and mid not in seen_ids:
+                        seen_ids.add(mid)
+                        markets.append(m)
+
+    return markets
+
+
 def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
     url = "https://gamma-api.polymarket.com/markets"
 
-    # 1) Try direct series query first (most reliable for rotating 15m markets)
-    # 2) Fallback to broader closed=false scan if series query returns empty.
-    params_list = [
-        {
-            "seriesSlug": "btc-up-or-down-15m",
-            "closed": "false",
-            "enableOrderBook": "true",
-            "limit": 500,
-        },
-        {
-            "closed": "false",
-            "enableOrderBook": "true",
-            "limit": 2000,
-        },
-    ]
-
-    markets = None
-    for params in params_list:
-        r = requests.get(url, params=params, timeout=15)
+    markets = fetch_btc_15m_markets_from_events()
+    if not markets:
+        # Fallback: broader market scan in case events endpoint misses fresh listings.
+        r = requests.get(
+            url,
+            params={"closed": "false", "enableOrderBook": "true", "limit": 2000},
+            timeout=20,
+        )
         r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            markets = data
-            break
+        markets = r.json()
 
     if not isinstance(markets, list):
         raise RuntimeError("Gamma response is not a list")
