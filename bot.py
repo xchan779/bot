@@ -82,6 +82,7 @@ class State:
 
 
 state = State()
+state_lock = threading.Lock()
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -168,20 +169,59 @@ def parse_json_list_field(v: Any) -> list:
     return []
 
 
+def parse_dt_utc(raw: Any) -> Optional[datetime]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def now_utc_from_clob(host: str, chain_id: int) -> datetime:
+    # Use exchange server time when available to reduce local clock drift.
+    try:
+        pub = ClobClient(host, chain_id=chain_id)
+        ts = None
+        if hasattr(pub, "get_server_time"):
+            ts = pub.get_server_time()
+        elif hasattr(pub, "getServerTime"):
+            ts = pub.getServerTime()
+        if ts is not None:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    except Exception as e:
+        logger.warning("server time fallback to local clock: %s", e)
+    return datetime.now(timezone.utc)
+
+
 def fetch_btc_15m_markets_from_events() -> list:
     events_url = "https://gamma-api.polymarket.com/events"
     markets_url = "https://gamma-api.polymarket.com/markets"
 
-    # Pull current open events, then resolve event slug -> market object.
-    r = requests.get(
-        events_url,
-        params={"closed": "false", "active": "true", "limit": 500},
-        timeout=20,
-    )
-    r.raise_for_status()
-    events = r.json()
-    if not isinstance(events, list):
-        return []
+    # Pull open events with pagination, then resolve event slug -> market object.
+    events: list = []
+    offset = 0
+    page_size = 500
+    while True:
+        r = requests.get(
+            events_url,
+            params={"closed": "false", "active": "true", "limit": page_size, "offset": offset},
+            timeout=20,
+        )
+        r.raise_for_status()
+        page = r.json()
+        if not isinstance(page, list) or not page:
+            break
+        events.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
 
     markets: list = []
     seen_ids = set()
@@ -238,7 +278,7 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
     if not isinstance(markets, list):
         raise RuntimeError("Gamma response is not a list")
 
-    now = datetime.now(timezone.utc)
+    now = now_utc_from_clob("https://clob.polymarket.com", 137)
     candidates = []
 
     for m in markets:
@@ -256,19 +296,11 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         # Accept BTC binary markets and infer 15m behavior from time-to-end.
         is_updown_like = ("up" in text and "down" in text) or ("higher" in text and "lower" in text)
 
-        start_s = m.get("startDate")
-        end_s = m.get("endDate") or m.get("endDateIso")
-        if not start_s or not end_s:
+        # Prefer eventStartTime when present; fallback to startDate.
+        start_dt = parse_dt_utc(m.get("eventStartTime") or m.get("startDate"))
+        end_dt = parse_dt_utc(m.get("endDate") or m.get("endDateIso"))
+        if start_dt is None or end_dt is None:
             continue
-        try:
-            start_dt = datetime.fromisoformat(str(start_s).replace("Z", "+00:00"))
-            end_dt = datetime.fromisoformat(str(end_s).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=timezone.utc)
-        if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=timezone.utc)
 
         # Market must be live now.
         if start_dt > now or end_dt <= now:
@@ -283,12 +315,12 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         if len(outcomes) != 2 or len(token_ids) != 2:
             continue
 
-        # Skip markets that are not currently tradeable.
-        if m.get("acceptingOrders") is not True:
+        # Skip only explicit non-tradeable markets. Some payloads omit this field.
+        if m.get("acceptingOrders") is False:
             continue
 
-        # Strictly target near-term 15m contract window.
-        if not (60 <= seconds_to_end <= 15 * 60):
+        # Target current/next 15m rotation window with tolerance.
+        if not (30 <= seconds_to_end <= 30 * 60):
             continue
 
         # Prefer explicit up/down naming if available, otherwise fallback to
@@ -330,7 +362,14 @@ def build_client(s: Settings) -> ClobClient:
 
     client = ClobClient(s.clob_host, **kwargs)
 
-    if s.api_key and s.api_secret and s.api_passphrase:
+    if (
+        s.api_key
+        and s.api_secret
+        and s.api_passphrase
+        and s.api_key != "AUTO"
+        and s.api_secret != "AUTO"
+        and s.api_passphrase != "AUTO"
+    ):
         creds = {
             "key": s.api_key,
             "secret": s.api_secret,
@@ -423,6 +462,38 @@ def place_limit_buy(
     }
 
 
+def place_fok_buy_usd(
+    client: ClobClient,
+    token_id: str,
+    stake_usd: float,
+    effective_max_price: float,
+) -> Dict[str, Any]:
+    # FOK/FAK BUY should be modeled as market-order style with amount in USD.
+    # We try SDK market-order methods first; fallback to limit+FOK if unavailable.
+    if hasattr(client, "create_market_order"):
+        mo = client.create_market_order(
+            {"tokenID": token_id, "amount": stake_usd, "side": BUY, "price": effective_max_price}
+        )
+        resp = client.post_order(mo, OrderType.FOK)
+        return {"token_id": token_id, "amount_usd": stake_usd, "worst_price": effective_max_price, "order_type": "FOK", "response": resp}
+    if hasattr(client, "createMarketOrder"):
+        mo = client.createMarketOrder(
+            {"tokenID": token_id, "amount": stake_usd, "side": BUY, "price": effective_max_price}
+        )
+        resp = client.post_order(mo, OrderType.FOK)
+        return {"token_id": token_id, "amount_usd": stake_usd, "worst_price": effective_max_price, "order_type": "FOK", "response": resp}
+
+    # Compatibility fallback
+    return place_limit_buy(
+        client=client,
+        token_id=token_id,
+        stake_usd=stake_usd,
+        max_limit_price=effective_max_price,
+        effective_max_price=effective_max_price,
+        post_only=False,
+    )
+
+
 def extract_order_id(resp: Any) -> Optional[str]:
     candidates = []
     if isinstance(resp, dict):
@@ -505,9 +576,10 @@ async def webhook(req: Request) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         signal_key = signal_key_for_payload(payload, now)
 
-        can, reason = state.can_trade(s, signal_key, now)
-        if not can:
-            return {"ok": False, "skipped": True, "reason": reason}
+        with state_lock:
+            can, reason = state.can_trade(s, signal_key, now)
+            if not can:
+                return {"ok": False, "skipped": True, "reason": reason}
 
         yes_token, no_token, market = choose_token_ids(s)
         token_id = yes_token if direction == "UP" else no_token
@@ -536,16 +608,25 @@ async def webhook(req: Request) -> Dict[str, Any]:
                 "token_id": token_id,
             }
 
-        order_info = place_limit_buy(
-            client=client,
-            token_id=token_id,
-            stake_usd=s.stake_usd,
-            max_limit_price=s.max_limit_price,
-            effective_max_price=effective_max_price,
-            post_only=s.post_only,
-        )
+        if s.post_only:
+            order_info = place_limit_buy(
+                client=client,
+                token_id=token_id,
+                stake_usd=s.stake_usd,
+                max_limit_price=s.max_limit_price,
+                effective_max_price=effective_max_price,
+                post_only=True,
+            )
+        else:
+            order_info = place_fok_buy_usd(
+                client=client,
+                token_id=token_id,
+                stake_usd=s.stake_usd,
+                effective_max_price=effective_max_price,
+            )
 
-        state.mark_trade(signal_key, now)
+        with state_lock:
+            state.mark_trade(signal_key, now)
 
         if s.post_only and s.order_ttl_seconds > 0:
             order_id = extract_order_id(order_info.get("response"))
