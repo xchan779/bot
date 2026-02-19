@@ -8,7 +8,9 @@ Automates YES/NO limit buys for BTC up/down 15m markets from TradingView alerts.
 - Chooses YES token for `UP`, NO token for `DOWN`.
 - Places limit buy with stake `$5` (configurable).
 - Enforces policy: effective price must be `<= 0.50`.
-- Uses `post_only` and risk limits.
+- Supports two modes:
+  - `POST_ONLY=false`: `FOK` immediate fill-or-kill.
+  - `POST_ONLY=true`: resting `GTC` limit + auto cancel after `ORDER_TTL_SECONDS`.
 
 ## Install
 ```bash

@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -351,6 +353,59 @@ def place_limit_buy(
     }
 
 
+def extract_order_id(resp: Any) -> Optional[str]:
+    candidates = []
+    if isinstance(resp, dict):
+        candidates.extend(
+            [
+                resp.get("orderID"),
+                resp.get("orderId"),
+                resp.get("id"),
+            ]
+        )
+        order_obj = resp.get("order")
+        if isinstance(order_obj, dict):
+            candidates.extend(
+                [
+                    order_obj.get("orderID"),
+                    order_obj.get("orderId"),
+                    order_obj.get("id"),
+                ]
+            )
+
+    for c in candidates:
+        if c is not None:
+            s = str(c).strip()
+            if s:
+                return s
+    return None
+
+
+def cancel_order_best_effort(client: ClobClient, order_id: str) -> Any:
+    # API method names differ across py-clob-client versions.
+    if hasattr(client, "cancel"):
+        return client.cancel(order_id)
+    if hasattr(client, "cancel_order"):
+        return client.cancel_order(order_id)
+    if hasattr(client, "cancel_orders"):
+        return client.cancel_orders([order_id])
+    raise RuntimeError("No cancel method available in client version")
+
+
+def schedule_cancel_if_open(s: Settings, order_id: str) -> None:
+    def _worker() -> None:
+        try:
+            time.sleep(max(1, s.order_ttl_seconds))
+            client = build_client(s)
+            resp = cancel_order_best_effort(client, order_id)
+            logger.info("TTL cancel attempted for order_id=%s resp=%s", order_id, resp)
+        except Exception as e:
+            logger.warning("TTL cancel failed for order_id=%s err=%s", order_id, e)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
 app = FastAPI(title="Polymarket BTC 15m Auto Trader")
 
 
@@ -421,6 +476,13 @@ async def webhook(req: Request) -> Dict[str, Any]:
         )
 
         state.mark_trade(signal_key, now)
+
+        if s.post_only and s.order_ttl_seconds > 0:
+            order_id = extract_order_id(order_info.get("response"))
+            if order_id:
+                schedule_cancel_if_open(s, order_id)
+            else:
+                logger.warning("post_only=true but order_id not found; TTL cancel skipped")
 
         return {
             "ok": True,
