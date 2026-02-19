@@ -217,19 +217,22 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         # Accept BTC binary markets and infer 15m behavior from time-to-end.
         is_updown_like = ("up" in text and "down" in text) or ("higher" in text and "lower" in text)
 
-        # endDateIso often contains only YYYY-MM-DD (no hour), which can make
-        # active intraday markets look expired. Prefer endDate with full time.
+        start_s = m.get("startDate")
         end_s = m.get("endDate") or m.get("endDateIso")
-        if not end_s:
+        if not start_s or not end_s:
             continue
         try:
+            start_dt = datetime.fromisoformat(str(start_s).replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(str(end_s).replace("Z", "+00:00"))
         except ValueError:
             continue
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
         if end_dt.tzinfo is None:
             end_dt = end_dt.replace(tzinfo=timezone.utc)
 
-        if end_dt <= now:
+        # Market must be live now.
+        if start_dt > now or end_dt <= now:
             continue
 
         seconds_to_end = (end_dt - now).total_seconds()
@@ -239,6 +242,10 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         outcomes = parse_json_list_field(m.get("outcomes"))
         token_ids = parse_json_list_field(m.get("clobTokenIds"))
         if len(outcomes) != 2 or len(token_ids) != 2:
+            continue
+
+        # Skip markets that are not currently tradeable.
+        if m.get("acceptingOrders") is not True:
             continue
 
         # Strictly target near-term 15m contract window.
