@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 load_dotenv()
@@ -468,14 +468,25 @@ def place_fok_buy_usd(
     stake_usd: float,
     effective_max_price: float,
 ) -> Dict[str, Any]:
-    # FOK/FAK BUY should be modeled as market-order style with amount in USD.
+    # FOK BUY should be modeled as market-order args with amount in USD.
     # We try SDK market-order methods first; fallback to limit+FOK if unavailable.
     if hasattr(client, "create_market_order"):
-        mo = client.create_market_order(
-            {"tokenID": token_id, "amount": stake_usd, "side": BUY, "price": effective_max_price}
+        mo_args = MarketOrderArgs(
+            token_id=token_id,
+            amount=stake_usd,
+            side=BUY,
+            price=effective_max_price,
+            order_type=OrderType.FOK,
         )
+        mo = client.create_market_order(mo_args)
         resp = client.post_order(mo, OrderType.FOK)
-        return {"token_id": token_id, "amount_usd": stake_usd, "worst_price": effective_max_price, "order_type": "FOK", "response": resp}
+        return {
+            "token_id": token_id,
+            "amount_usd": stake_usd,
+            "worst_price": effective_max_price,
+            "order_type": "FOK",
+            "response": resp,
+        }
     if hasattr(client, "createMarketOrder"):
         mo = client.createMarketOrder(
             {"tokenID": token_id, "amount": stake_usd, "side": BUY, "price": effective_max_price}
@@ -593,7 +604,10 @@ async def webhook(req: Request) -> Dict[str, Any]:
         # Optional pre-check using current best ask. If no ask, we still try FOK limit.
         best_ask = None
         try:
-            book = client.get_book(token_id)
+            if hasattr(client, "get_order_book"):
+                book = client.get_order_book(token_id)
+            else:
+                book = client.get_book(token_id)
             best_ask = extract_best_ask(book)
         except Exception as e:
             logger.warning("book pre-check failed: %s", e)
