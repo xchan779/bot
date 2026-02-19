@@ -172,7 +172,6 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
     url = "https://gamma-api.polymarket.com/markets"
     params = {
         "closed": "false",
-        "active": "true",
         "enableOrderBook": "true",
         "limit": 1000,
     }
@@ -221,15 +220,17 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         if len(outcomes) != 2 or len(token_ids) != 2:
             continue
 
-        # Map YES/NO token positions
-        # For up/down binary markets outcomes are typically ["Yes","No"]
+        # Map token positions supporting both ["Yes","No"] and ["Up","Down"].
+        # We keep variable names yes/no for compatibility with downstream code:
+        # yes_token => token to buy when model says UP
+        # no_token  => token to buy when model says DOWN
         out0 = str(outcomes[0]).strip().lower()
         out1 = str(outcomes[1]).strip().lower()
 
-        if out0 == "yes" and out1 == "no":
+        if out0 in {"yes", "up"} and out1 in {"no", "down"}:
             yes_token = str(token_ids[0])
             no_token = str(token_ids[1])
-        elif out0 == "no" and out1 == "yes":
+        elif out0 in {"no", "down"} and out1 in {"yes", "up"}:
             yes_token = str(token_ids[1])
             no_token = str(token_ids[0])
         else:
@@ -240,8 +241,9 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
             continue
 
         # Keep only short-horizon markets likely to be 15m contracts.
-        # We allow 2..30 minutes to tolerate listing/rollover timing.
-        if seconds_to_end < 120 or seconds_to_end > 1800:
+        # We allow up to 2 hours so we can select the next contract even if
+        # Gamma hasn't flipped active=true yet.
+        if seconds_to_end < 30 or seconds_to_end > 7200:
             continue
 
         # Prefer explicit up/down naming if available, otherwise fallback to
