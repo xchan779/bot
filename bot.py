@@ -200,7 +200,9 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         # Accept BTC binary markets and infer 15m behavior from time-to-end.
         is_updown_like = ("up" in text and "down" in text) or ("higher" in text and "lower" in text)
 
-        end_s = m.get("endDateIso") or m.get("endDate")
+        # endDateIso often contains only YYYY-MM-DD (no hour), which can make
+        # active intraday markets look expired. Prefer endDate with full time.
+        end_s = m.get("endDate") or m.get("endDateIso")
         if not end_s:
             continue
         try:
