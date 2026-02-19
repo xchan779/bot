@@ -198,8 +198,9 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
             continue
         if "15" not in text:
             continue
-        if "up" not in text or "down" not in text:
-            continue
+        # Some 15m BTC markets are not labeled explicitly as "up/down" and may
+        # be phrased as yes/no around a reference level. Keep them as candidates.
+        is_updown_like = ("up" in text and "down" in text) or ("higher" in text and "lower" in text)
 
         end_s = m.get("endDateIso") or m.get("endDate")
         if not end_s:
@@ -236,13 +237,16 @@ def find_active_btc_15m_market() -> Tuple[str, str, Dict[str, Any]]:
         if seconds_to_end <= 0:
             continue
 
-        candidates.append((seconds_to_end, yes_token, no_token, m))
+        # Prefer explicit up/down naming if available, otherwise fallback to
+        # nearest active BTC 15m yes/no market.
+        priority = 0 if is_updown_like else 1
+        candidates.append((priority, seconds_to_end, yes_token, no_token, m))
 
     if not candidates:
         raise RuntimeError("No active BTC 15m up/down market found in Gamma")
 
-    candidates.sort(key=lambda x: x[0])
-    _, yes_token, no_token, market = candidates[0]
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    _, _, yes_token, no_token, market = candidates[0]
     return yes_token, no_token, market
 
 
