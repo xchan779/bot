@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ class Settings:
     api_secret: str
     api_passphrase: str
     auto_derive_api_creds: bool
+    trade_log_csv: str
 
 
 class State:
@@ -83,6 +85,7 @@ class State:
 
 state = State()
 state_lock = threading.Lock()
+trade_log_lock = threading.Lock()
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -115,7 +118,57 @@ def load_settings() -> Settings:
         api_secret=os.getenv("POLY_API_SECRET", ""),
         api_passphrase=os.getenv("POLY_API_PASSPHRASE", ""),
         auto_derive_api_creds=_env_bool("AUTO_DERIVE_API_CREDS", True),
+        trade_log_csv=os.getenv("TRADE_LOG_CSV", "trades_log.csv"),
     )
+
+
+TRADE_LOG_HEADERS = [
+    "ts_utc",
+    "status",
+    "reason",
+    "direction",
+    "signal_key",
+    "market_slug",
+    "market_question",
+    "token_id",
+    "best_ask",
+    "effective_max_price",
+    "stake_usd",
+    "order_type",
+    "order_status",
+    "order_id",
+    "tx_hash",
+    "payload_time",
+    "payload_symbol",
+    "payload_msg",
+]
+
+
+def append_trade_log(s: Settings, row: Dict[str, Any]) -> None:
+    path = s.trade_log_csv
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    out: Dict[str, Any] = {k: row.get(k, "") for k in TRADE_LOG_HEADERS}
+    with trade_log_lock:
+        write_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=TRADE_LOG_HEADERS)
+            if write_header:
+                w.writeheader()
+            w.writerow(out)
+
+
+def get_recent_trades_from_csv(path: str, limit: int) -> list:
+    if not os.path.exists(path):
+        return []
+    rows: list = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows[-limit:]
 
 
 def parse_payload(body: Any) -> Dict[str, Any]:
@@ -578,9 +631,24 @@ def health() -> Dict[str, Any]:
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 
+@app.get("/trades/recent")
+def trades_recent(limit: int = 20) -> Dict[str, Any]:
+    s = load_settings()
+    n = max(1, min(limit, 200))
+    return {"ok": True, "count": n, "rows": get_recent_trades_from_csv(s.trade_log_csv, n)}
+
+
 @app.post("/webhook")
 async def webhook(req: Request) -> Dict[str, Any]:
     s = load_settings()
+    now = datetime.now(timezone.utc)
+    direction = ""
+    signal_key = ""
+    payload: Dict[str, Any] = {}
+    market: Dict[str, Any] = {}
+    token_id = ""
+    best_ask = None
+    effective_max_price = s.max_limit_price - s.fee_buffer
 
     try:
         content_type = (req.headers.get("content-type") or "").lower()
@@ -596,25 +664,36 @@ async def webhook(req: Request) -> Dict[str, Any]:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
         direction = parse_direction(payload)
-        now = datetime.now(timezone.utc)
         signal_key = signal_key_for_payload(payload, now)
 
         with state_lock:
             can, reason = state.can_trade(s, signal_key, now)
             if not can:
+                append_trade_log(
+                    s,
+                    {
+                        "ts_utc": now.isoformat(),
+                        "status": "skipped",
+                        "reason": reason,
+                        "direction": direction,
+                        "signal_key": signal_key,
+                        "stake_usd": s.stake_usd,
+                        "payload_time": payload.get("time", ""),
+                        "payload_symbol": payload.get("symbol", ""),
+                        "payload_msg": payload.get("msg", ""),
+                    },
+                )
                 return {"ok": False, "skipped": True, "reason": reason}
 
         yes_token, no_token, market = choose_token_ids(s)
         token_id = yes_token if direction == "UP" else no_token
 
-        effective_max_price = s.max_limit_price - s.fee_buffer
         if effective_max_price <= 0:
             raise HTTPException(status_code=400, detail="effective_max_price <= 0. Lower FEE_BUFFER")
 
         client = build_client(s)
 
         # Optional pre-check using current best ask. If no ask, we still try FOK limit.
-        best_ask = None
         try:
             if hasattr(client, "get_order_book"):
                 book = client.get_order_book(token_id)
@@ -623,6 +702,25 @@ async def webhook(req: Request) -> Dict[str, Any]:
             logger.warning("book pre-check failed: %s", e)
 
         if best_ask is not None and best_ask > effective_max_price:
+            append_trade_log(
+                s,
+                {
+                    "ts_utc": now.isoformat(),
+                    "status": "skipped",
+                    "reason": f"best_ask {best_ask:.4f} > effective_max_price {effective_max_price:.4f}",
+                    "direction": direction,
+                    "signal_key": signal_key,
+                    "market_slug": market.get("slug", ""),
+                    "market_question": market.get("question", ""),
+                    "token_id": token_id,
+                    "best_ask": best_ask,
+                    "effective_max_price": round(effective_max_price, 4),
+                    "stake_usd": s.stake_usd,
+                    "payload_time": payload.get("time", ""),
+                    "payload_symbol": payload.get("symbol", ""),
+                    "payload_msg": payload.get("msg", ""),
+                },
+            )
             return {
                 "ok": False,
                 "skipped": True,
@@ -659,6 +757,41 @@ async def webhook(req: Request) -> Dict[str, Any]:
             else:
                 logger.warning("post_only=true but order_id not found; TTL cancel skipped")
 
+        resp_obj = order_info.get("response")
+        order_status = ""
+        tx_hash = ""
+        order_id = ""
+        if isinstance(resp_obj, dict):
+            order_status = str(resp_obj.get("status", ""))
+            order_id = str(resp_obj.get("orderID") or resp_obj.get("orderId") or "")
+            txs = resp_obj.get("transactionsHashes")
+            if isinstance(txs, list) and txs:
+                tx_hash = str(txs[0])
+
+        append_trade_log(
+            s,
+            {
+                "ts_utc": now.isoformat(),
+                "status": "ok",
+                "reason": "",
+                "direction": direction,
+                "signal_key": signal_key,
+                "market_slug": market.get("slug", ""),
+                "market_question": market.get("question", ""),
+                "token_id": token_id,
+                "best_ask": best_ask,
+                "effective_max_price": round(effective_max_price, 4),
+                "stake_usd": s.stake_usd,
+                "order_type": order_info.get("order_type", ""),
+                "order_status": order_status,
+                "order_id": order_id,
+                "tx_hash": tx_hash,
+                "payload_time": payload.get("time", ""),
+                "payload_symbol": payload.get("symbol", ""),
+                "payload_msg": payload.get("msg", ""),
+            },
+        )
+
         return {
             "ok": True,
             "direction": direction,
@@ -670,8 +803,44 @@ async def webhook(req: Request) -> Dict[str, Any]:
             "order": order_info,
         }
 
-    except HTTPException:
+    except HTTPException as e:
+        append_trade_log(
+            s,
+            {
+                "ts_utc": now.isoformat(),
+                "status": "error",
+                "reason": str(e.detail),
+                "direction": direction,
+                "signal_key": signal_key,
+                "market_slug": market.get("slug", ""),
+                "token_id": token_id,
+                "best_ask": best_ask,
+                "effective_max_price": round(effective_max_price, 4),
+                "stake_usd": s.stake_usd,
+                "payload_time": payload.get("time", ""),
+                "payload_symbol": payload.get("symbol", ""),
+                "payload_msg": payload.get("msg", ""),
+            },
+        )
         raise
     except Exception as e:
         logger.exception("webhook failed")
+        append_trade_log(
+            s,
+            {
+                "ts_utc": now.isoformat(),
+                "status": "error",
+                "reason": str(e),
+                "direction": direction,
+                "signal_key": signal_key,
+                "market_slug": market.get("slug", ""),
+                "token_id": token_id,
+                "best_ask": best_ask,
+                "effective_max_price": round(effective_max_price, 4),
+                "stake_usd": s.stake_usd,
+                "payload_time": payload.get("time", ""),
+                "payload_symbol": payload.get("symbol", ""),
+                "payload_msg": payload.get("msg", ""),
+            },
+        )
         raise HTTPException(status_code=500, detail=str(e))
